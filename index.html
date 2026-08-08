@@ -942,13 +942,11 @@ Respond with STRICT JSON ONLY. No markdown, no code fences, no commentary outsid
 
 async function callModel(userText){
   const body = {
-    model: "claude-sonnet-4-6",
-    max_tokens: 1000,
     system: buildSystemPrompt(state.candidate),
     messages: [...state.apiHistory, { role: "user", content: userText }]
   };
 
-  const response = await fetch("https://api.anthropic.com/v1/messages", {
+  const response = await fetch("/api/interview", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body)
