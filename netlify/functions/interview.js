@@ -12,9 +12,15 @@ export const handler = async (event) => {
 
   const apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey) {
+    const visibleKeys = Object.keys(process.env)
+      .filter(k => !k.startsWith('AWS_') && !k.startsWith('_'))
+      .sort();
     return {
       statusCode: 500,
-      body: JSON.stringify({ error: 'GEMINI_API_KEY is not configured on the server' })
+      body: JSON.stringify({
+        error: 'GEMINI_API_KEY is not configured on the server',
+        debug_visible_env_var_names: visibleKeys
+      })
     };
   }
 
