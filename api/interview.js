@@ -1,7 +1,13 @@
 // Vercel serverless function.
-// Keeps the real Anthropic API key on the server — never sent to the browser.
-// The frontend calls POST /api/interview with { system, messages } and gets
-// back the same shape as Anthropic's /v1/messages response.
+// Calls Google's Gemini API server-side, using an API key stored only in
+// Vercel's environment variables — never in this file, never in the browser.
+//
+// The frontend keeps sending the same shape it always has: { system, messages }
+// where messages is [{ role: "user" | "assistant", content: "..." }].
+// This function translates that into Gemini's request format, and translates
+// Gemini's response back into the { content: [{ type: "text", text }] }
+// shape the frontend already knows how to parse — so index.html needed no
+// changes beyond pointing at /api/interview.
 
 export default async function handler(req, res) {
   if (req.method !== 'POST') {
@@ -9,9 +15,9 @@ export default async function handler(req, res) {
     return;
   }
 
-  const apiKey = process.env.ANTHROPIC_API_KEY;
+  const apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey) {
-    res.status(500).json({ error: 'ANTHROPIC_API_KEY is not configured on the server' });
+    res.status(500).json({ error: 'GEMINI_API_KEY is not configured on the server' });
     return;
   }
 
@@ -21,19 +27,22 @@ export default async function handler(req, res) {
     return;
   }
 
+  const contents = messages.map(m => ({
+    role: m.role === 'assistant' ? 'model' : 'user',
+    parts: [{ text: m.content }]
+  }));
+
+  const model = 'gemini-2.0-flash';
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
+
   try {
-    const upstream = await fetch('https://api.anthropic.com/v1/messages', {
+    const upstream = await fetch(url, {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-api-key': apiKey,
-        'anthropic-version': '2023-06-01'
-      },
+      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        model: 'claude-sonnet-4-6',
-        max_tokens: 1000,
-        system,
-        messages
+        contents,
+        systemInstruction: { parts: [{ text: system }] },
+        generationConfig: { maxOutputTokens: 1000, temperature: 0.7 }
       })
     });
 
@@ -42,8 +51,13 @@ export default async function handler(req, res) {
       res.status(upstream.status).json(data);
       return;
     }
-    res.status(200).json(data);
+
+    const candidate = (data.candidates || [])[0];
+    const text = candidate?.content?.parts?.map(p => p.text || '').join('') || '';
+
+    // Re-shape into the same envelope the frontend already expects.
+    res.status(200).json({ content: [{ type: 'text', text }] });
   } catch (err) {
-    res.status(502).json({ error: 'Failed to reach Anthropic API', detail: String(err) });
+    res.status(502).json({ error: 'Failed to reach Gemini API', detail: String(err) });
   }
 }
