@@ -7,8 +7,8 @@ export const handler = async () => {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
       ok: true,
-      geminiConfigured: Boolean(process.env.GEMINI_API_KEY),
-      model: process.env.GEMINI_MODEL || 'gemini-2.0-flash'
+      groqConfigured: Boolean(process.env.GROQ_API_KEY),
+      model: process.env.GROQ_MODEL || 'openai/gpt-oss-20b'
     })
   };
 };

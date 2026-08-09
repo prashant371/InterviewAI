@@ -1,20 +1,23 @@
 // Netlify Function — single source of truth for the /api/interview backend.
 // (netlify.toml redirects /api/* -> /.netlify/functions/:splat)
 //
+// Uses Groq's OpenAI-compatible chat completions API. Groq's free developer
+// tier has genuinely usable rate limits (unlike the Gemini free tier, which
+// returned a hard 0-quota error for this project's keys).
+//
 // Responsibilities:
-//   - Read GEMINI_API_KEY / GEMINI_MODEL from server-side env only.
-//   - Call Gemini's generateContent endpoint with a timeout.
-//   - Translate this app's { system, messages } request shape into Gemini's
-//     request shape, and translate Gemini's response back into the
+//   - Read GROQ_API_KEY / GROQ_MODEL from server-side env only.
+//   - Call Groq's chat completions endpoint with a timeout.
+//   - Translate this app's { system, messages } request shape into OpenAI's
+//     chat message array, and translate the response back into the
 //     { content: [{ type: "text", text }] } shape the frontend expects.
-//   - Return categorized, non-sensitive error JSON on every failure path,
-//     so the frontend can tell the user what actually went wrong instead of
-//     silently dropping into offline mode.
+//   - Return categorized, non-sensitive error JSON on every failure path.
 //
 // Error response shape (all error paths):
 //   { "error": "<short machine-ish category>", "message": "<human-readable, safe>", "details": "<optional safe extra info>" }
 
-const GEMINI_TIMEOUT_MS = 30000;
+const GROQ_TIMEOUT_MS = 30000;
+const GROQ_URL = 'https://api.groq.com/openai/v1/chat/completions';
 
 function jsonResponse(statusCode, body) {
   return {
@@ -59,12 +62,12 @@ export const handler = async (event) => {
     return jsonResponse(405, { error: 'method_not_allowed', message: 'Only POST is supported on this endpoint.' });
   }
 
-  const apiKey = process.env.GEMINI_API_KEY;
+  const apiKey = process.env.GROQ_API_KEY;
   if (!apiKey) {
     log('missing_api_key', {});
     return jsonResponse(500, {
       error: 'server_configuration_error',
-      message: 'GEMINI_API_KEY is not configured'
+      message: 'GROQ_API_KEY is not configured'
     });
   }
 
@@ -83,56 +86,62 @@ export const handler = async (event) => {
     });
   }
 
-  const contents = messages.map(m => ({
-    role: m.role === 'assistant' ? 'model' : 'user',
-    parts: [{ text: String(m.content ?? '') }]
-  }));
+  // OpenAI-compatible chat format: system prompt is just another message
+  // with role "system", and "assistant"/"user" roles pass through unchanged
+  // (no role translation needed, unlike Gemini's "model" role).
+  const chatMessages = [
+    { role: 'system', content: system },
+    ...messages.map(m => ({ role: m.role === 'assistant' ? 'assistant' : 'user', content: String(m.content ?? '') }))
+  ];
 
-  const model = process.env.GEMINI_MODEL || 'gemini-2.0-flash';
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(apiKey)}`;
+  const model = process.env.GROQ_MODEL || 'openai/gpt-oss-20b';
 
   const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), GEMINI_TIMEOUT_MS);
+  const timeoutId = setTimeout(() => controller.abort(), GROQ_TIMEOUT_MS);
 
   let upstream;
   try {
-    log('gemini_request_started', { model });
-    upstream = await fetch(url, {
+    log('groq_request_started', { model });
+    upstream = await fetch(GROQ_URL, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${apiKey}`
+      },
       signal: controller.signal,
       body: JSON.stringify({
-        contents,
-        systemInstruction: { parts: [{ text: system }] },
-        generationConfig: { maxOutputTokens: 1000, temperature: 0.7 }
+        model,
+        messages: chatMessages,
+        max_tokens: 1000,
+        temperature: 0.7
       })
     });
   } catch (err) {
     clearTimeout(timeoutId);
     const durationMs = Date.now() - startedAt;
     if (err.name === 'AbortError') {
-      log('gemini_timeout', { durationMs });
+      log('groq_timeout', { durationMs });
       return jsonResponse(504, {
-        error: 'gemini_timeout',
-        message: `The AI service did not respond within ${GEMINI_TIMEOUT_MS / 1000}s. Please retry.`
+        error: 'groq_timeout',
+        message: `The AI service did not respond within ${GROQ_TIMEOUT_MS / 1000}s. Please retry.`
       });
     }
-    log('gemini_network_error', { durationMs, error: String(err) });
+    log('groq_network_error', { durationMs, error: String(err) });
     return jsonResponse(502, {
       error: 'network_error',
-      message: 'Could not reach the Gemini API. Check your connection and retry.'
+      message: 'Could not reach the Groq API. Check your connection and retry.'
     });
   }
   clearTimeout(timeoutId);
 
   const durationMs = Date.now() - startedAt;
-  log('gemini_response_received', { status: upstream.status, durationMs });
+  log('groq_response_received', { status: upstream.status, durationMs });
 
   let data;
   try {
     data = await upstream.json();
   } catch (e) {
-    log('gemini_malformed_response', { durationMs });
+    log('groq_malformed_response', { durationMs });
     return jsonResponse(502, {
       error: 'malformed_upstream_response',
       message: 'The AI service returned an unreadable response. Please retry.'
@@ -142,32 +151,32 @@ export const handler = async (event) => {
   if (!upstream.ok) {
     const status = upstream.status;
     const apiMessage = data?.error?.message || 'Unknown upstream error.';
-    let category = 'gemini_api_error';
+    let category = 'groq_api_error';
     let message = 'The AI service returned an error.';
 
     if (status === 401 || status === 403) {
       category = 'invalid_api_key';
-      message = 'The configured Gemini API key was rejected. It may be invalid, revoked, or missing required permissions.';
+      message = 'The configured Groq API key was rejected. It may be invalid, revoked, or missing required permissions.';
     } else if (status === 429) {
       category = 'rate_limited';
-      message = 'The Gemini API quota or rate limit was exceeded. Please wait and retry.';
+      message = 'The Groq API quota or rate limit was exceeded. Please wait and retry.';
     } else if (status === 400) {
-      category = 'gemini_bad_request';
-      message = 'The request to the Gemini API was malformed.';
+      category = 'groq_bad_request';
+      message = 'The request to the Groq API was malformed.';
     } else if (status >= 500) {
-      category = 'gemini_unavailable';
-      message = 'The Gemini API is temporarily unavailable. Please retry.';
+      category = 'groq_unavailable';
+      message = 'The Groq API is temporarily unavailable. Please retry.';
     }
 
-    log('gemini_error_response', { status, category, durationMs });
+    log('groq_error_response', { status, category, durationMs });
     return jsonResponse(status, { error: category, message, details: apiMessage });
   }
 
-  const candidate = (data.candidates || [])[0];
-  const text = candidate?.content?.parts?.map(p => p.text || '').join('') || '';
+  const choice = (data.choices || [])[0];
+  const text = choice?.message?.content || '';
 
   if (!text) {
-    log('gemini_empty_candidate', { durationMs });
+    log('groq_empty_choice', { durationMs });
     return jsonResponse(502, {
       error: 'empty_model_response',
       message: 'The AI service returned no usable content. Please retry.'
@@ -177,11 +186,11 @@ export const handler = async (event) => {
   // Sanity-check that the model's text is actually the JSON turn payload the
   // frontend expects. We still return the raw text either way — the
   // frontend does its own robust extraction — but this lets logs
-  // distinguish "Gemini is fine but off-format" from real outages.
+  // distinguish "Groq is fine but off-format" from real outages.
   try {
     extractJsonObject(text);
   } catch (e) {
-    log('gemini_response_not_json', { durationMs });
+    log('groq_response_not_json', { durationMs });
   }
 
   log('request_succeeded', { durationMs });
