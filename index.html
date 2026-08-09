@@ -1066,6 +1066,7 @@ function activateFallback(){
   if(state.usingFallback) return;
   state.usingFallback = true;
   state.fallbackStep = 0;
+  state.fallbackAnswerLog = [];
   showFallbackNote();
 }
 
@@ -1102,14 +1103,25 @@ function fallbackQuestionBank(candidate){
 }
 
 function fallbackFeedback(candidate){
+  const log = state.fallbackAnswerLog || [];
+  const weakCount = log.filter(a => !a.engaged).length;
+  const engagedSummary = log.length === 0
+    ? "No answers were logged for keyword review."
+    : weakCount === 0
+      ? "Every answer engaged directly with its domain's core vocabulary."
+      : `${weakCount} of ${log.length} answers read as brief or off-topic based on keyword coverage — worth revisiting those domains.`;
+
   return {
-    summary: `${candidate.name} completed the offline assessment across all five domains, calibrated to a ${candidate.exp}-year ${candidate.role} background. ${candidate.signal}. Responses reflected a working grasp of the core concepts with room to deepen hands-on practice in a couple of areas.`,
-    strengths: [
+    summary: `${candidate.name} completed the offline assessment across all five domains, calibrated to a ${candidate.exp}-year ${candidate.role} background. ${candidate.signal}. ${engagedSummary} Note: this offline mode checks answers heuristically (keyword coverage), not true comprehension — treat this report as a rough guide, not a substitute for the live adaptive interview.`,
+    strengths: weakCount < log.length ? [
       "You engaged clearly with each domain and gave concrete, reasoned answers rather than definitions alone.",
       "Your explanations of embeddings and retrieval concepts showed solid conceptual grounding.",
       "You stayed consistent in reasoning depth across the full session."
+    ] : [
+      "You completed all five domains without skipping any."
     ],
     gaps: [
+      ...(weakCount > 0 ? [`${weakCount} response(s) were short or didn't clearly reference the domain's key concepts — consider expanding those with concrete examples.`] : []),
       "Push further into production failure modes — where pipelines break under real traffic, not just how they work in theory.",
       "Bring more specificity to trade-off questions: name concrete tools, metrics, or thresholds where possible."
     ],
@@ -1119,6 +1131,32 @@ function fallbackFeedback(candidate){
       "Write a one-page runbook for deploying and monitoring an LLM-backed service."
     ]
   };
+}
+
+/* Rough per-domain keyword sets used only to sanity-check that an answer
+   actually engages with the topic. This is a heuristic, not real evaluation —
+   it can't judge correctness the way the live model can, but it stops the
+   fallback bank from praising empty or off-topic answers. */
+const DOMAIN_KEYWORDS = {
+  embeddings: ['vector','embed','dimension','similar','semantic','distance','cosine','chunk','index','hnsw'],
+  rag: ['retriev','context','query','document','chunk','hallucin','pipeline','search','augment'],
+  prompting: ['prompt','instruction','wording','format','schema','example','shot','token','system'],
+  agents: ['tool','action','agent','mcp','workflow','orchestrat','handshake','call','autonom'],
+  deploy: ['docker','kubernetes','container','scale','monitor','latency','probe','rate limit','deploy','observ']
+};
+
+function evaluateFallbackAnswer(domainKey, text){
+  const trimmed = (text || '').trim();
+  if(trimmed.length < 12){
+    return { engaged:false, note:"That's quite brief — worth a fuller answer in a real interview, but let's keep moving." };
+  }
+  const lower = trimmed.toLowerCase();
+  const keywords = DOMAIN_KEYWORDS[domainKey] || [];
+  const hit = keywords.some(k => lower.includes(k));
+  if(!hit){
+    return { engaged:false, note:"That reads a little off the core topic — worth tying it back to the domain more directly." };
+  }
+  return { engaged:true, note:null };
 }
 
 function runFallbackTurn(userText){
