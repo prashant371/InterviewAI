@@ -1,32 +1,30 @@
 # PROMPTS.md
 
-This is the real prompt log from building and shipping **InterviewAI**. It's not a cleaned-up story written after the fact — it's the actual back-and-forth, including the parts where things broke, because that's what vibe coding with an AI pair actually looks like.
-
-The original interview-simulator concept, UI (cosmic dark theme, particle field, mission bar), and prompt-engineering for the interviewer persona were vibe-coded first in a separate session (Gemini/Antigravity). Everything below is the session where it went from "a single HTML file" to "a real deployed, working product" — debugging, infra, backend architecture, and hardening, entirely through prompting.
+The actual prompts used to build, debug, and ship InterviewAI, in order.
 
 ---
 
-## 1. Kickoff — "make it better if you want"
+### Initial build
 
 > i have given you the web site check it and make the changes to make it better if you want, thier are more different file read them if you want help.
 
-No spec, no ticket — just "here's what I have, go." This is the actual starting prompt. From here the AI read the full HTML/CSS/JS, found real bugs on its own initiative (a control string leaking into the visible chat, fragile JSON parsing that silently killed the live AI), and fixed them without being told what was wrong first.
-
-## 2. Ship it
+### GitHub
 
 > nice working, push it on my github prashant-371
 
-> did as you told but nothing change
-
-One-line prompts driving a real deploy pipeline: repo creation, git push, and — after a token with the wrong permission scope — self-correcting to a working one.
-
-## 3. "Deploy this" — three platforms, three sets of platform-specific bugs
+### Deployment — Vercel
 
 > ok now i want to deploy this on versel
 
 > it is not running after deplyed
 
-> did it again got this *(pasted a live 429 quota error)*
+> did as you told but nothing change
+
+### Live AI backend
+
+> anthropic is the paid one so we can do it with gemini api key [REDACTED] this is the api key use it and make the error correct
+
+### Deployment — Netlify
 
 > just deploy this on netlify
 
@@ -34,44 +32,76 @@ One-line prompts driving a real deploy pipeline: repo creation, git push, and �
 
 > do something
 
-Each one-liner forced a different real diagnosis: Vercel serving `interviewai.html` instead of `index.html` at the root, Vercel's ESM/CommonJS ambiguity warning, a straight-up typo in an env var name (`GEMINI_API_KEY1`) found only by making the backend self-report its own visible env vars, and finally a hard Google Cloud free-tier quota wall that no amount of retrying fixes.
+> [pasted the exact JSON error response from the deployed API]
 
-`do something` is maybe the most honest prompt in this whole log — the point where "walk me through more dashboard clicks" stopped being useful and the fix had to move into the code itself (a self-diagnosing error response) instead of another round of screenshots.
-
-## 4. The actual engineering spec
-
-This is the one worth reading in full — this is what separates "vibe coded" from "vibe coded well." A full technical requirements doc, written mid-project, once the surface-level fixes stopped being enough:
-
-> I need you to completely debug and fix my InterviewAI project... IMPORTANT: Do not just explain the problem. Inspect the entire repository and directly modify the code to make the application work reliably... CRITICAL REQUIREMENTS: 1. DO NOT expose the Gemini API key in browser JavaScript... 13. Do not silently convert every API failure into offline mode... 14. Add a visible "Retry live AI" option when the live API fails... 16. Add timeout handling using AbortController... 27. Preserve the existing strict JSON interview response format... *(45 numbered requirements total — see full text in repo history / commit `2d06e47`)*
-
-This single prompt drove: removing a duplicate/conflicting backend, categorized error handling (auth vs. rate-limit vs. timeout vs. malformed response), a `/api/health` endpoint that reports config status without ever leaking the key, `AbortController`-based timeouts, and a frontend that preserves interview state and offers **Retry live AI** instead of silently and permanently switching to offline mode on any hiccup.
-
-## 5. Provider pivot, live
-
-> anthropic is the paid one so we can do it with gemini api key... use it and make the error correct
+### Quota troubleshooting
 
 > will i can use this google cloud after some time or not
 
 > i have another API key given by BREETH which is organizing the hackathon should i use it
 
-> first one *(choosing "get a free Groq key instead" from three options presented)*
+> first one
 
-The backend was swapped from Anthropic → Gemini → Groq over the course of this conversation, each time because real quota problems surfaced, not hypothetical ones. The Breeth key turned out to be a memory-layer API, not an LLM — caught before wasting a build cycle wiring it in wrong.
+### Full reliability rework
 
-## 6. Ship, verify, done
+> I need you to completely debug and fix my InterviewAI project.
+>
+> This is a hackathon project, so reliability is more important than adding unnecessary features.
+>
+> IMPORTANT: Do not just explain the problem. Inspect the entire repository and directly modify the code to make the application work reliably.
+>
+> CRITICAL REQUIREMENTS
+>
+> 1. DO NOT expose the Gemini API key in browser JavaScript.
+> 2. DO NOT store the Gemini API key in localStorage, sessionStorage, cookies, HTML, or frontend JavaScript.
+> 3. The production Gemini API key must ONLY be read server-side using process.env.GEMINI_API_KEY.
+> 4. The frontend should NEVER directly call Google's Gemini API.
+> 5. Keep the API endpoint POST /api/interview.
+> 6. Keep the existing frontend request format { system, messages }.
+> 7. Keep the existing response format expected by the frontend { content: [{ type: "text", text }] }.
+> 8. Make the Netlify implementation the single source of truth.
+> 9. Remove or clearly disable the duplicate Vercel implementation if it creates confusion.
+> 10. Add robust error handling — return useful JSON errors without exposing the actual API key.
+> 11. Validate that GEMINI_API_KEY exists; return a clear configuration error if not.
+> 12. Do not return environment variable names to the browser — remove the debug_visible_env_var_names field completely.
+> 13. Do not silently convert every API failure into offline mode. Distinguish network failure, missing key, invalid key, quota/rate limit, model/API errors, malformed response, and JSON parsing errors.
+> 14. Add a visible "Retry live AI" option when the live API fails.
+> 15. If live AI fails, do not destroy the current interview state — allow retry without restarting.
+> 16. Add timeout handling using AbortController (~30 seconds).
+> 17. Handle Gemini responses safely — validate before assuming candidates[0].content.parts[0].text exists.
+> 18. Preserve/return the correct status code for Gemini errors (400, 401, 403, 429, 500).
+> 19–21. CORS only if needed; keep existing UI/design intact; keep the offline question bank.
+> 22. Fix the offline fallback state machine if necessary — check that state.lastFeedback is properly initialized/managed.
+> 23. Make the model configurable via GEMINI_MODEL env var with a sensible default.
+> 24–28. Construct the API URL safely; convert message roles correctly (assistant → model, user → user); pass the system instruction separately; preserve the strict JSON response schema; make JSON parsing robust against fenced/stray text.
+> 29. Do not put a real API key into the repository — check history for accidentally committed secrets.
+> 30–31. Verify netlify.toml routing and Netlify runtime compatibility.
+> 32. Check package.json — no unnecessary dependencies.
+> 33. Add a /api/health endpoint that never exposes secrets.
+> 34. Add clear server logs (request received, request started, response status, duration, error category) without ever logging the key or full sensitive data.
+> 35–36. Fix any other obvious bugs found while inspecting the repo; review all core files.
+> 37. Test: valid key, missing key, invalid key, rate limit, timeout, malformed JSON, provider unavailable, retry-after-failure.
+> 38. Do not implement a frontend API-key input — production uses Netlify env vars only.
+> 39–45. After fixing everything: list of files changed, exact reason for each change, exact env vars to configure, exact deployment steps, exact test procedure, remaining risks.
+>
+> Do not stop at identifying the issue. Make the code changes.
+
+### Provider switch
+
+> [screenshot of a 429 rate-limit error in DevTools]
 
 > GROQ_API_KEY is not configured getting this error
 
 > this time it works
 
+### Verification
+
+> check it for me https://aiinterviewr.netlify.app/ go a head
+
 > i checked it its working great
 
-The last real bug: Netlify Functions don't pick up new env vars without a fresh deploy — a one-line fix once identified.
+### Documentation
 
----
+> A PROMPTS.md in the repo, or exported chat transcripts. This is how we verify the build was genuinely vibe-coded.
 
-## What this log is actually evidence of
-
-Not "typed a paragraph and got a finished app." Real iterative debugging across three deploy platforms, two LLM providers, a security review of the whole git history for leaked secrets, and a 45-point reliability spec that got fully implemented — commit by commit, driven by prompts, with the person in the loop testing on a real deployed URL after every change.
-
-Full commit history: [`github.com/prashant371/InterviewAI/commits/main`](https://github.com/prashant371/InterviewAI/commits/main)
+> and add a read me file in interview repo
