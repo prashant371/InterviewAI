@@ -416,8 +416,21 @@
   .fallback-note{
     font-family:var(--font-mono); font-size:10.5px; color:var(--warn); background:var(--warn-bg);
     border:1px solid rgba(251,191,36,0.25); padding:8px 12px; border-radius:8px; margin-bottom:14px;
-    display:flex; align-items:center; gap:8px;
+    display:flex; align-items:center; gap:8px; flex-wrap:wrap;
   }
+  .fallback-note.error-note{
+    color:#fca5a5; background:rgba(239,68,68,0.08); border-color:rgba(239,68,68,0.25);
+  }
+  .fallback-note span{ flex:1 1 auto; min-width:160px; }
+  .error-note-btn{
+    font-family:var(--font-mono); font-size:10px; padding:5px 10px; border-radius:6px; cursor:pointer;
+    border:1px solid rgba(0,217,255,0.35); background:rgba(0,217,255,0.08); color:var(--cyan);
+  }
+  .error-note-btn:hover{ background:rgba(0,217,255,0.18); }
+  .error-note-btn.secondary{
+    border-color:rgba(255,255,255,0.15); background:transparent; color:var(--text-muted);
+  }
+  .error-note-btn.secondary:hover{ background:rgba(255,255,255,0.06); }
 
   @media (max-width:600px){
     .topbar{ padding:16px 18px; }
@@ -631,8 +644,11 @@ const state = {
   apiHistory: [],       // [{role, content}] raw JSON turns sent to the model
   usingFallback: false,
   fallbackStep: 0,
+  fallbackAnswerLog: [],
   awaitingReply: false,
-  ended: false
+  ended: false,
+  lastFeedback: null,
+  pendingRetryText: undefined // null = retry begin; string = retry that answer; undefined = no pending retry
 };
 
 /* ============================= PARTICLE FIELD ============================= */
@@ -813,7 +829,10 @@ function selectCandidate(candidate){
   state.apiHistory = [];
   state.usingFallback = false;
   state.fallbackStep = 0;
+  state.fallbackAnswerLog = [];
   state.ended = false;
+  state.lastFeedback = null;
+  state.pendingRetryText = undefined;
 
   document.getElementById('interview-cand-info').innerHTML = `
     <div class="cand-avatar" style="background:linear-gradient(135deg,${candidate.color[0]},${candidate.color[1]})">${initials(candidate.name)}</div>
@@ -946,16 +965,30 @@ async function callModel(userText){
     messages: [...state.apiHistory, { role: "user", content: userText }]
   };
 
-  const response = await fetch("/api/interview", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body)
-  });
+  let response;
+  try{
+    response = await fetch("/api/interview", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body)
+    });
+  }catch(networkErr){
+    throw liveError('network_error', 'Could not reach the server. Check your connection and retry.');
+  }
 
-  if(!response.ok) throw new Error("API request failed: " + response.status);
+  if(!response.ok){
+    let errBody = null;
+    try{ errBody = await response.json(); }catch(_){ /* body wasn't JSON */ }
+    const category = (errBody && errBody.error) || ('http_' + response.status);
+    const message = (errBody && errBody.message) || `The server returned an error (status ${response.status}).`;
+    throw liveError(category, message, response.status);
+  }
+
   const data = await response.json();
   const textBlock = (data.content || []).find(b => b.type === 'text');
-  if(!textBlock) throw new Error("No text block in response");
+  if(!textBlock){
+    throw liveError('malformed_response', 'The AI response was missing expected content. Please retry.');
+  }
 
   let cleaned = textBlock.text.trim().replace(/^```json/i,'').replace(/^```/,'').replace(/```$/,'').trim();
   let parsed;
@@ -965,14 +998,26 @@ async function callModel(userText){
     // Model occasionally wraps or precedes the JSON with stray text despite
     // instructions — fall back to extracting the outermost {...} block.
     const match = cleaned.match(/\{[\s\S]*\}/);
-    if(!match) throw e;
-    parsed = JSON.parse(match[0]);
+    if(!match) throw liveError('json_parse_error', 'The AI response could not be parsed. Please retry.');
+    try{
+      parsed = JSON.parse(match[0]);
+    }catch(e2){
+      throw liveError('json_parse_error', 'The AI response could not be parsed. Please retry.');
+    }
   }
 
   state.apiHistory.push({ role: "user", content: userText });
   state.apiHistory.push({ role: "assistant", content: textBlock.text });
 
   return parsed;
+}
+
+function liveError(category, userMessage, status){
+  const e = new Error(category);
+  e.category = category;
+  e.userMessage = userMessage;
+  e.status = status;
+  return e;
 }
 
 async function beginInterview(){
@@ -982,14 +1027,14 @@ async function beginInterview(){
     const parsed = await callModel("START_INTERVIEW");
     hideTyping();
     applyModelTurn(parsed);
+    setComposerBusy(false);
+    document.getElementById('composer-input').focus();
   }catch(err){
     hideTyping();
     console.error(err);
-    activateFallback();
-    runFallbackTurn(null);
+    setComposerBusy(false);
+    showLiveErrorBanner(err, null);
   }
-  setComposerBusy(false);
-  document.getElementById('composer-input').focus();
 }
 
 function applyModelTurn(parsed){
@@ -1029,12 +1074,61 @@ async function submitTurn(override){
     const parsed = await callModel(text);
     hideTyping();
     applyModelTurn(parsed);
+    setComposerBusy(false);
+    focusComposer();
   }catch(err){
     hideTyping();
     console.error(err);
-    activateFallback();
-    runFallbackTurn(text);
+    setComposerBusy(false);
+    showLiveErrorBanner(err, text);
   }
+}
+
+/* ---- Live-error banner: retry live AI, or deliberately switch to offline ----
+   Errors no longer auto-trigger the offline bank. The candidate's message
+   (if any) has already been added to the chat and is NOT re-sent until the
+   user chooses Retry, so no state is lost or duplicated. */
+
+function showLiveErrorBanner(err, retryText){
+  state.pendingRetryText = retryText;
+  const message = (err && err.userMessage) || 'Something went wrong reaching the live AI.';
+  document.getElementById('fallback-note-slot').innerHTML = `
+    <div class="fallback-note error-note">
+      <svg width="13" height="13" viewBox="0 0 24 24" fill="none"><path d="M12 9V13M12 17H12.01M10.29 3.86L1.82 18A2 2 0 0 0 3.54 21H20.46A2 2 0 0 0 22.18 18L13.71 3.86A2 2 0 0 0 10.29 3.86Z" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      <span>${escapeHtml(message)}</span>
+      <button type="button" class="error-note-btn" onclick="retryLiveCall()">Retry live AI</button>
+      <button type="button" class="error-note-btn secondary" onclick="useOfflineNow()">Continue offline instead</button>
+    </div>`;
+}
+
+function clearNoteSlot(){
+  document.getElementById('fallback-note-slot').innerHTML = '';
+}
+
+async function retryLiveCall(){
+  clearNoteSlot();
+  const text = state.pendingRetryText;
+  setComposerBusy(true);
+  showTyping();
+  try{
+    const parsed = text === null ? await callModel("START_INTERVIEW") : await callModel(text);
+    hideTyping();
+    applyModelTurn(parsed);
+    setComposerBusy(false);
+    focusComposer();
+  }catch(err){
+    hideTyping();
+    console.error(err);
+    setComposerBusy(false);
+    showLiveErrorBanner(err, text);
+  }
+}
+
+function useOfflineNow(){
+  clearNoteSlot();
+  const text = state.pendingRetryText;
+  activateFallback();
+  runFallbackTurn(text === undefined ? null : text);
   setComposerBusy(false);
   focusComposer();
 }
@@ -1179,17 +1273,32 @@ function runFallbackTurn(userText){
 
   state.fallbackStep++;
   if(state.fallbackStep >= order.length){
+    const finalDomain = order[order.length - 1];
+    const finalEval = evaluateFallbackAnswer(finalDomain, userText);
+    state.fallbackAnswerLog = state.fallbackAnswerLog || [];
+    state.fallbackAnswerLog.push({ domain: finalDomain, engaged: finalEval.engaged });
+
     addMessage('interviewer', `That covers all five domains — nice work, ${state.candidate.name.split(' ')[0]}. Generating your evaluation report now.`);
     state.ended = true;
     setTimeout(() => showReport(fallbackFeedback(state.candidate)), 500);
     return;
   }
 
+  // The answer just given (userText) belongs to the domain we were on
+  // *before* this increment — i.e. order[state.fallbackStep - 1].
+  const answeredDomain = order[state.fallbackStep - 1];
+  const evalResult = evaluateFallbackAnswer(answeredDomain, userText);
+  state.fallbackAnswerLog = state.fallbackAnswerLog || [];
+  state.fallbackAnswerLog.push({ domain: answeredDomain, engaged: evalResult.engaged });
+
   state.missionIndex = state.fallbackStep;
   renderMissionBar();
   const domainKey = order[state.fallbackStep];
   const domainLabel = MISSIONS[state.fallbackStep].label;
-  addMessage('interviewer', `Good — let's move to ${domainLabel}.\n${bank[domainKey]}`);
+  const transition = evalResult.engaged
+    ? 'Good'
+    : evalResult.note;
+  addMessage('interviewer', `${transition} — let's move to ${domainLabel}.\n${bank[domainKey]}`);
 }
 
 /* ============================= REPORT ============================= */
